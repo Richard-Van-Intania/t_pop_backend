@@ -2,12 +2,11 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Router, http::StatusCode, routing::get};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use sqlx::{Error, query_as};
 use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
-use std::time::Duration;
 use tokio::signal;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -30,7 +29,7 @@ async fn main() {
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect("postgres://postgres:KHzgNMS2SMKA5Hi2ddPXdh97dEzoGbLSLDT7tNOLU0QoipuudtcQ3tgXO0FxXAD0@localhost:5432/t_pop_app")
         .await
         .unwrap();
@@ -42,10 +41,11 @@ async fn main() {
         .route("/login", post(login))
         .route("/packages", get(packages))
         .route("/subscriptions/{users_uuid}", get(subscriptions))
+        .route("/subscriptions/buy", post(buy_subscription))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(15),
+            std::time::Duration::from_secs(15),
         ))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -53,6 +53,11 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlainText {
+    pub text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,6 +102,14 @@ struct SubscriptionWithPackage {
     price: f64,
     duration_days: i32,
     benefits: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BuySubscription {
+    users_uuid: Uuid,
+    packages_uuid: Uuid,
+    duration_days: i32,
+    payment_method: String,
 }
 
 async fn login(
@@ -171,6 +184,29 @@ ORDER BY s.created_at DESC",
         Err(_) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "error_pg_select_subscriptions".to_string(),
+        )),
+    }
+}
+
+async fn buy_subscription(
+    State(state): State<AppState>,
+    Json(payload): Json<BuySubscription>,
+) -> Result<Json<PlainText>, (StatusCode, String)> {
+    let expired_at = Utc::now() + Duration::days(payload.duration_days as i64);
+    let insert: Result<(Uuid,), Error> = query_as("INSERT INTO public.subscriptions( users_uuid, packages_uuid, created_at, expired_at, is_active, payment_method ) VALUES ($1, $2, now(), $3, true, $4) RETURNING subscriptions_uuid")
+        .bind(&payload.users_uuid)
+        .bind(&payload.packages_uuid)
+        .bind(&expired_at)
+        .bind(&payload.payment_method)
+        .fetch_one(&state.pool)
+        .await;
+    match insert {
+        Ok((subscriptions_uuid,)) => Ok(Json(PlainText {
+            text: subscriptions_uuid.to_string(),
+        })),
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "error_pg_insert_subscriptions".to_string(),
         )),
     }
 }
